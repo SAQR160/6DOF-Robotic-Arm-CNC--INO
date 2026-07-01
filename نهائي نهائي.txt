@@ -1,0 +1,1180 @@
+// ---------------------------------------------------------
+// بيئة المعايرة الشاملة V8 - (Faster Clear Demo, Anti-Crush, Differential, EEPROM Save)
+// ---------------------------------------------------------
+#include <EEPROM.h> // تضمين مكتبة الذاكرة الدائمة
+
+// تعريف دبابيس المحركات (STEP / DIR)
+const int A1_STEP = 54; const int A1_DIR  = 55; // RAMPS X
+const int A2_STEP = 26; const int A2_DIR  = 28; // RAMPS E0 
+const int A3_STEP = 60; const int A3_DIR  = 61; // RAMPS Y
+const int A4_STEP = 36; const int A4_DIR  = 34; // RAMPS E1
+const int M5_STEP = 46; const int M5_DIR  = 48; // RAMPS Z
+const int M6_STEP = 65; const int M6_DIR  = 66; // RAMPS AUX-2
+
+// تعريف دبابيس السويتشات (NC)
+const int A1_MIN = 3;   const int A1_MAX = 2;  
+const int A2_MIN = 14;  const int A2_MAX = 15; 
+const int A3_REF = 18;  const int A4_REF = 19; 
+const int HEAD_SHARED_SAFETY = 32; 
+const int LASER_PIN = 9;
+
+// متغيرات المعايرة النشطة
+long steps_A1=0, steps_A2=0, steps_A3=0, steps_A4=0, steps_A5=0, steps_A6=0;
+float cur_A1=0, cur_A2=0, cur_A3=0, cur_A4=0, cur_A5=0, cur_A6=0;
+int mic_A1=0, mic_A2=0, mic_A3=0, mic_A4=0, mic_A5=0, mic_A6=0;
+bool dir_A1=HIGH, dir_A2=HIGH, dir_A3=HIGH, dir_A4=HIGH, dir_A5=HIGH, dir_A6=HIGH; 
+
+// متغيرات الرأس التفاضلي 
+bool M6_same_as_M5_for_Cube = true; 
+bool M6_same_as_M5_for_Rotation = false;
+
+// إعدادات سرعات المعايرة الأصلية
+int pulse_delay_fast = 150;
+int pulse_delay_normal = 1200;
+
+// ---------------------------------------------------------
+// إضافات V8: سرعات مستقلة للرسمة التجريبية مع تسارع/تباطؤ
+// كل قيمة تمثل نصف زمن نبضة STEP بالميكروثانية.
+// القيمة الأصغر = حركة أسرع.
+// ---------------------------------------------------------
+const unsigned int DEMO_START_DELAY_US   = 900; // بداية/نهاية ناعمة للمقطع
+const unsigned int DEMO_TRAVEL_DELAY_US  = 260; // انتقال سريع والليزر مفصول
+const unsigned int DEMO_DRAW_DELAY_US    = 340; // رسم سريع وواضح والليزر يعمل
+const unsigned int DEMO_HOME_DELAY_US    = 420; // رجوع آمن وسريع إلى Home
+const long DEMO_ACCEL_MAX_STEPS          = 320; // أقصى طول لمنطقة التسارع/التباطؤ
+const unsigned long DEMO_DIR_SETTLE_US   = 20;  // مهلة تثبيت اتجاه DIR قبل أول نبضة
+const unsigned long DEMO_SEGMENT_PAUSE_MS = 90; // فصل بصري بسيط بين المقاطع
+
+// ---------------------------------------------------------
+// إضافات V7: حالة الجلسة، الليزر، والتشغيل التجريبي الآمن
+// ---------------------------------------------------------
+const bool LASER_ACTIVE_HIGH = true;
+const int SWITCH_TRIGGERED_STATE = HIGH;  // مطابق لتوصيل NC المستخدم في كود المعايرة
+const long RUNTIME_BACKOFF_EXTRA_STEPS = 150;
+const long RUNTIME_BACKOFF_MAX_STEPS = 4000;
+
+bool sessionHomeKnown = false;   // تصبح true فقط بعد انتهاء معايرة كاملة في نفس الجلسة
+bool laserVerified = false;      // تأكيد يدوي لظهور الليزر
+long runtimePos[7] = {0, 0, 0, 0, 0, 0, 0}; // موضع نسبي عن المنتصف للمحاور 1..6
+
+enum RuntimeStopReason {
+  RUNTIME_STOP_NONE,
+  RUNTIME_STOP_ESTOP,
+  RUNTIME_STOP_SWITCH,
+  RUNTIME_STOP_SOFT_LIMIT,
+  RUNTIME_STOP_INVALID_TARGET,
+  RUNTIME_STOP_BACKOFF_FAILED
+};
+
+RuntimeStopReason lastRuntimeStop = RUNTIME_STOP_NONE;
+
+// ---------------------------------------------------------
+// هيكل الحفظ في الذاكرة الدائمة (EEPROM Struct)
+// ---------------------------------------------------------
+struct CalibrationData {
+  long magicNumber; // كود للتحقق من صحة البيانات
+  long s_A1; bool d_A1;
+  long s_A2; bool d_A2;
+  long s_A3; bool d_A3;
+  long s_A4; bool d_A4;
+  long s_A5; bool d_A5;
+  long s_A6; bool d_A6;
+  bool m6_cube;
+  bool m6_rot;
+} savedData;
+
+const int EEPROM_ADDR = 0; 
+const long VALID_MAGIC_NUM = 123456789; // رقم سري لتأكيد صحة التخزين
+
+// تصريحات مسبقة للدوال المستخدمة قبل تعريفها
+void clearSerial();
+void executeInteractiveCalibration();
+void recallAndPrintEEPROM();
+void setLaser(bool on);
+bool testLaserInteractive();
+void markCurrentSessionAtHome();
+void runDrawingDemo();
+bool returnAllAxesToHome();
+
+// دالة تحديث الذاكرة الدائمة
+void saveToEEPROM() {
+  savedData.magicNumber = VALID_MAGIC_NUM;
+  savedData.s_A1 = steps_A1; savedData.d_A1 = dir_A1;
+  savedData.s_A2 = steps_A2; savedData.d_A2 = dir_A2;
+  savedData.s_A3 = steps_A3; savedData.d_A3 = dir_A3;
+  savedData.s_A4 = steps_A4; savedData.d_A4 = dir_A4;
+  savedData.s_A5 = steps_A5; savedData.d_A5 = dir_A5;
+  savedData.s_A6 = steps_A6; savedData.d_A6 = dir_A6;
+  savedData.m6_cube = M6_same_as_M5_for_Cube;
+  savedData.m6_rot = M6_same_as_M5_for_Rotation;
+  
+  EEPROM.put(EEPROM_ADDR, savedData); // put تقوم بالتحديث فقط إذا تغيرت القيمة للحفاظ على عمر الفلاش
+  Serial.println(F("\n[!] >> تم حفظ نتائج المعايرة بنجاح في الذاكرة الدائمة (EEPROM) << [!]"));
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  pinMode(A1_STEP, OUTPUT); pinMode(A1_DIR, OUTPUT);
+  pinMode(A2_STEP, OUTPUT); pinMode(A2_DIR, OUTPUT);
+  pinMode(A3_STEP, OUTPUT); pinMode(A3_DIR, OUTPUT);
+  pinMode(A4_STEP, OUTPUT); pinMode(A4_DIR, OUTPUT);
+  pinMode(M5_STEP, OUTPUT); pinMode(M5_DIR, OUTPUT);
+  pinMode(M6_STEP, OUTPUT); pinMode(M6_DIR, OUTPUT);
+  
+  pinMode(LASER_PIN, OUTPUT); digitalWrite(LASER_PIN, LOW);
+
+  pinMode(A1_MIN, INPUT_PULLUP); pinMode(A1_MAX, INPUT_PULLUP);
+  pinMode(A2_MIN, INPUT_PULLUP); pinMode(A2_MAX, INPUT_PULLUP);
+  pinMode(A3_REF, INPUT_PULLUP); pinMode(A4_REF, INPUT_PULLUP);
+  pinMode(HEAD_SHARED_SAFETY, INPUT_PULLUP);
+
+  Serial.println(F("=========================================================="));
+  Serial.println(F(">> نظام المعايرة المتتالي الشامل (بخاصية الحفظ في الفلاش) <<"));
+  Serial.println(F("=========================================================="));
+}
+
+void loop() {
+  Serial.println(F("\n============================================="));
+  Serial.println(F("  أرسل (S) لبدء جلسة معايرة جديدة كاملة"));
+  Serial.println(F("  أرسل (R) لعرض بيانات EEPROM فقط"));
+  Serial.println(F("  أرسل (L) لاختبار ضوء الليزر"));
+  Serial.println(F("  أرسل (D) لتشغيل رسمة تجريبية من معايرة نفس الجلسة"));
+  Serial.println(F("  أرسل (H) لإرجاع جميع المحاور إلى Home المسجل"));
+  Serial.println(F("============================================="));
+
+  while (!Serial.available());
+  char ch = toupper(Serial.read());
+  clearSerial();
+
+  if (ch == 'S') {
+    executeInteractiveCalibration();
+  } else if (ch == 'R') {
+    recallAndPrintEEPROM();
+  } else if (ch == 'L') {
+    laserVerified = testLaserInteractive();
+  } else if (ch == 'D') {
+    runDrawingDemo();
+  } else if (ch == 'H') {
+    returnAllAxesToHome();
+  } else {
+    Serial.println(F("أمر غير معروف."));
+  }
+}
+
+
+// ---------------------------------------------------------
+// الدوال المساعدة والتفاعلية
+// ---------------------------------------------------------
+void clearSerial() { delay(50); while (Serial.available() > 0) Serial.read(); }
+float askFloat(String msg) { clearSerial(); Serial.print(msg); while (!Serial.available()); float v = Serial.parseFloat(); Serial.println(v); return v; }
+int askInt(String msg) { clearSerial(); Serial.print(msg); while (!Serial.available()); int v = Serial.parseInt(); Serial.println(v); return v; }
+void waitForAnyKey(String msg) { clearSerial(); Serial.println(msg); while (!Serial.available()); clearSerial(); }
+
+bool askYesNo(String msg) {
+  clearSerial(); Serial.println(msg);
+  while (true) {
+    if (Serial.available() > 0) {
+      char c = toupper(Serial.read());
+      if (c == 'Y') { Serial.println("Yes"); return true; }
+      if (c == 'N') { Serial.println("No"); return false; }
+    }
+  }
+}
+
+char checkLiveCommand() {
+  if (Serial.available() > 0) {
+    char c = toupper(Serial.read());
+    if (c == 'E' || c == 'S') return c; 
+  }
+  return 0;
+}
+
+// حركة مؤقتة 
+void moveForOneSecond(int step1, int dirPin1, int step2, int dirPin2, bool d1, bool d2, int speedUs, int safetySw = -1) {
+  digitalWrite(dirPin1, d1);
+  if (step2 != -1) digitalWrite(dirPin2, d2);
+  unsigned long startMillis = millis();
+  while(millis() - startMillis < 1000) {
+    if (safetySw != -1 && digitalRead(safetySw) == HIGH) {
+        Serial.println(F("\n>> تنبيه ميكانيكي: تم ملامسة السويتش أثناء الاختبار! (تم الإيقاف لحماية الماكينة)"));
+        break;
+    }
+    digitalWrite(step1, HIGH); if(step2 != -1) digitalWrite(step2, HIGH); delayMicroseconds(speedUs);
+    digitalWrite(step1, LOW);  if(step2 != -1) digitalWrite(step2, LOW);  delayMicroseconds(speedUs);
+  }
+}
+
+void handleEmergencyStop(int step1, int dirPin1, int step2, int dirPin2, bool curD1, bool curD2, int speedUs) {
+  setLaser(false);
+  Serial.println(F("\n!!! تم تفعيل إيقاف الطوارئ الفوري والليزر مفصول !!!"));
+  while(true) {
+    if(askYesNo(F("هل تريد عكس الاتجاه لمدة ثانية لفك الاشتباك الميكانيكي؟ (Y/N)"))) {
+      Serial.println(F("يتم التراجع الآن..."));
+      moveForOneSecond(step1, dirPin1, step2, dirPin2, !curD1, !curD2, speedUs);
+      if(!askYesNo(F("هل تريد التراجع أكثر (Y) أم نبدأ معايرة المحور من جديد (N)؟"))) break;
+    } else { break; }
+  }
+  Serial.println(F(">> جاري إعادة معايرة المحور الحالي من الصفر..."));
+}
+
+int testDirectionTimeBased(int step1, int dirPin1, int step2, int dirPin2, bool d1, bool d2, int speedUs, int safetySw = -1) {
+  Serial.println(F("جاري الحركة لمدة ثانية واحدة لاختبار الاتجاه..."));
+  moveForOneSecond(step1, dirPin1, step2, dirPin2, d1, d2, speedUs, safetySw);
+  while(true) {
+    clearSerial();
+    Serial.println(F("هل الاتجاه صحيح؟ (Y = نعم، N = لا اعكسه، E = طوارئ)"));
+    while(!Serial.available());
+    char c = toupper(Serial.read());
+    if (c == 'Y') return 1;
+    if (c == 'N') return 0;
+    if (c == 'E') return -1;
+  }
+}
+
+// ---------------------------------------------------------
+// دوال الحركة المجمعة
+// ---------------------------------------------------------
+bool moveToSwitch(int step1, int dirPin1, bool d1, int sw1, int sw2, int speedUs, int step2=-1, int dirPin2=-1, bool d2=LOW) {
+  digitalWrite(dirPin1, d1); if(step2 != -1) digitalWrite(dirPin2, d2);
+  while (digitalRead(sw1) == LOW && (sw2 == -1 || digitalRead(sw2) == LOW)) {
+    if (checkLiveCommand() == 'E') return false; 
+    digitalWrite(step1, HIGH); if(step2 != -1) digitalWrite(step2, HIGH); delayMicroseconds(speedUs);
+    digitalWrite(step1, LOW);  if(step2 != -1) digitalWrite(step2, LOW);  delayMicroseconds(speedUs);
+  }
+  return true; 
+}
+
+long countStepsAndEscape(int step1, int dirPin1, bool d1, int sw1, int sw2, int speedUs, bool manualStop, int step2=-1, int dirPin2=-1, bool d2=LOW) {
+  digitalWrite(dirPin1, d1); if(step2 != -1) digitalWrite(dirPin2, d2);
+  
+  if (sw1 != -1) {
+    long escapeCrush = 0;
+    while (digitalRead(sw1) == HIGH || (sw2 != -1 && digitalRead(sw2) == HIGH)) {
+      if (checkLiveCommand() == 'E') return -1;
+      digitalWrite(step1, HIGH); if(step2 != -1) digitalWrite(step2, HIGH); delayMicroseconds(speedUs);
+      digitalWrite(step1, LOW);  if(step2 != -1) digitalWrite(step2, LOW);  delayMicroseconds(speedUs);
+      
+      escapeCrush++;
+      if (escapeCrush > 4000) {
+          Serial.println(F("\n!! طوارئ: الموتور يدهس السويتش ولا يبتعد عنه! (تم إيقاف الحركة) !!"));
+          return -1;
+      }
+    }
+    for(int i=0; i<150; i++) {
+      if (checkLiveCommand() == 'E') return -1;
+      digitalWrite(step1, HIGH); if(step2 != -1) digitalWrite(step2, HIGH); delayMicroseconds(speedUs);
+      digitalWrite(step1, LOW);  if(step2 != -1) digitalWrite(step2, LOW);  delayMicroseconds(speedUs);
+    }
+  }
+
+  long steps = 0;
+  while(true) {
+    char cmd = checkLiveCommand();
+    if (cmd == 'E') return -1; 
+    if (manualStop && cmd == 'S') break; 
+    
+    if (sw1 != -1 && digitalRead(sw1) == HIGH) { Serial.println(F("\n>> تم الوصول للسويتش!")); break; }
+    if (sw2 != -1 && digitalRead(sw2) == HIGH) { Serial.println(F("\n>> تم الوصول للسويتش!")); break; }
+    
+    digitalWrite(step1, HIGH); if(step2 != -1) digitalWrite(step2, HIGH); delayMicroseconds(speedUs);
+    digitalWrite(step1, LOW);  if(step2 != -1) digitalWrite(step2, LOW);  delayMicroseconds(speedUs);
+    steps++;
+  }
+  return steps;
+}
+
+bool moveToCenter(long totalSteps, int step1, int dirPin1, bool d1, int speedUs, int step2=-1, int dirPin2=-1, bool d2=LOW) {
+  digitalWrite(dirPin1, d1); if(step2 != -1) digitalWrite(dirPin2, d2);
+  for(long i=0; i < totalSteps/2; i++) {
+    if (checkLiveCommand() == 'E') return false;
+    digitalWrite(step1, HIGH); if(step2 != -1) digitalWrite(step2, HIGH); delayMicroseconds(speedUs);
+    digitalWrite(step1, LOW);  if(step2 != -1) digitalWrite(step2, LOW);  delayMicroseconds(speedUs);
+  }
+  return true;
+}
+
+void printAxisReport(int axis) {
+  Serial.println(F("\n============================================="));
+  if(axis == 1) {
+    Serial.println(F("Axis: A1 (Linear)"));
+    Serial.print(F("Total_Steps: ")); Serial.println(steps_A1);
+    Serial.print(F("Center_Home: ")); Serial.println(steps_A1/2);
+    Serial.print(F("DIR_State: ")); Serial.println(dir_A1 ? "HIGH" : "LOW");
+  } 
+  else if(axis == 2) {
+    Serial.println(F("Axis: A2 (Rotary)"));
+    Serial.print(F("Total_Steps: ")); Serial.println(steps_A2);
+    Serial.print(F("Center_Home: ")); Serial.println(steps_A2/2);
+    Serial.print(F("DIR_State: ")); Serial.println(dir_A2 ? "HIGH" : "LOW");
+  }
+  else if(axis == 3) {
+    Serial.println(F("Axis: A3 (Arm 1)"));
+    Serial.print(F("Total_Steps: ")); Serial.println(steps_A3);
+    Serial.print(F("Center_Home: ")); Serial.println(steps_A3/2);
+    Serial.print(F("DIR_State: ")); Serial.println(dir_A3 ? "HIGH" : "LOW");
+  }
+  else if(axis == 4) {
+    Serial.println(F("Axis: A4 (Arm 2)"));
+    Serial.print(F("Total_Steps: ")); Serial.println(steps_A4);
+    Serial.print(F("Center_Home: ")); Serial.println(steps_A4/2);
+    Serial.print(F("DIR_State: ")); Serial.println(dir_A4 ? "HIGH" : "LOW");
+  }
+  else if(axis == 5) {
+    Serial.println(F("Axis: A5 (Differential Cube)"));
+    Serial.print(F("Total_Steps: ")); Serial.println(steps_A5);
+    Serial.print(F("Center_Home: ")); Serial.println(steps_A5/2);
+    Serial.print(F("M5_M6_DIR_States: ")); 
+    Serial.println(dir_A5 ? (M6_same_as_M5_for_Cube ? "HIGH / HIGH" : "HIGH / LOW") : (M6_same_as_M5_for_Cube ? "LOW / LOW" : "LOW / HIGH"));
+  }
+  else if(axis == 6) {
+    Serial.println(F("Axis: A6 (Laser Rotation)"));
+    Serial.print(F("Total_Steps: ")); Serial.println(steps_A6);
+    Serial.print(F("Center_Home: ")); Serial.println(steps_A6/2);
+    Serial.print(F("M5_M6_DIR_States: ")); 
+    Serial.println(dir_A6 ? (M6_same_as_M5_for_Rotation ? "HIGH / HIGH" : "HIGH / LOW") : (M6_same_as_M5_for_Rotation ? "LOW / LOW" : "LOW / HIGH"));
+  }
+  Serial.println(F("============================================="));
+  waitForAnyKey(F(">> قم بنسخ التقرير أعلاه، ثم اضغط أي مفتاح للمتابعة..."));
+}
+
+// ---------------------------------------------------------
+// المعايرة الرئيسية المتتالية
+// ---------------------------------------------------------
+void executeInteractiveCalibration() {
+  Serial.println(F("\n-- تلميح: أرسل حرف (E) في أي لحظة لتفعيل إيقاف الطوارئ --"));
+  
+  // ==================== [1] المحور A1 ====================
+  while(true) {
+    Serial.println(F("\n--- [1] المحور الأفقي A1 ---"));
+    cur_A1 = askFloat("التيار (A): "); mic_A1 = askInt("Microstep: ");
+    
+    waitForAnyKey("اضغط للبدء باختبار الاتجاه (1 ثانية)...");
+    int dt = testDirectionTimeBased(A1_STEP, A1_DIR, -1, -1, HIGH, LOW, pulse_delay_fast, A1_MIN);
+    if (dt == -1) { handleEmergencyStop(A1_STEP, A1_DIR, -1, -1, HIGH, LOW, pulse_delay_fast); continue; }
+    dir_A1 = (dt == 1) ? HIGH : LOW;
+    
+    Serial.println(F("يتحرك للبحث عن البداية..."));
+    if(!moveToSwitch(A1_STEP, A1_DIR, dir_A1, A1_MIN, A1_MAX, pulse_delay_fast)) {
+      handleEmergencyStop(A1_STEP, A1_DIR, -1, -1, dir_A1, LOW, pulse_delay_fast); continue;
+    }
+    
+    Serial.println(F("تم الوصول! يعكس الاتجاه لحساب الشوط..."));
+    steps_A1 = countStepsAndEscape(A1_STEP, A1_DIR, !dir_A1, A1_MIN, A1_MAX, pulse_delay_fast, false);
+    if(steps_A1 == -1) { handleEmergencyStop(A1_STEP, A1_DIR, -1, -1, !dir_A1, LOW, pulse_delay_fast); continue; }
+    
+    Serial.println(F("جاري العودة للمنتصف..."));
+    if(!moveToCenter(steps_A1, A1_STEP, A1_DIR, dir_A1, pulse_delay_fast)) {
+      handleEmergencyStop(A1_STEP, A1_DIR, -1, -1, dir_A1, LOW, pulse_delay_fast); continue;
+    }
+    
+    saveToEEPROM(); // حفظ الفلاش
+    if(askYesNo("هل تريد طباعة تقرير المحور A1 الآن لنسخه؟ (Y/N)")) printAxisReport(1);
+    if(askYesNo("تمت المعايرة بنجاح! هل تريد الانتقال للمحور التالي؟ (Y=التالي، N=إعادة A1)")) break;
+  }
+
+  // ==================== [2] المحور A2 ====================
+  while(true) {
+    Serial.println(F("\n--- [2] المحور الدائري A2 ---"));
+    cur_A2 = askFloat("التيار (A): "); mic_A2 = askInt("Microstep: ");
+    
+    waitForAnyKey("اضغط للبدء باختبار الاتجاه...");
+    int dt = testDirectionTimeBased(A2_STEP, A2_DIR, -1, -1, HIGH, LOW, pulse_delay_normal, A2_MIN);
+    if (dt == -1) { handleEmergencyStop(A2_STEP, A2_DIR, -1, -1, HIGH, LOW, pulse_delay_normal); continue; }
+    dir_A2 = (dt == 1) ? HIGH : LOW;
+    
+    Serial.println(F("يبحث عن البداية..."));
+    if(!moveToSwitch(A2_STEP, A2_DIR, dir_A2, A2_MIN, A2_MAX, pulse_delay_normal)) {
+      handleEmergencyStop(A2_STEP, A2_DIR, -1, -1, dir_A2, LOW, pulse_delay_normal); continue;
+    }
+    
+    Serial.println(F("يعكس الاتجاه للعد..."));
+    steps_A2 = countStepsAndEscape(A2_STEP, A2_DIR, !dir_A2, A2_MIN, A2_MAX, pulse_delay_normal, false);
+    if(steps_A2 == -1) { handleEmergencyStop(A2_STEP, A2_DIR, -1, -1, !dir_A2, LOW, pulse_delay_normal); continue; }
+    
+    Serial.println(F("يعود للمنتصف..."));
+    if(!moveToCenter(steps_A2, A2_STEP, A2_DIR, dir_A2, pulse_delay_normal)) {
+      handleEmergencyStop(A2_STEP, A2_DIR, -1, -1, dir_A2, LOW, pulse_delay_normal); continue;
+    }
+
+    saveToEEPROM(); // حفظ الفلاش
+    if(askYesNo("هل تريد طباعة تقرير المحور A2 الآن لنسخه؟ (Y/N)")) printAxisReport(2);
+    if(askYesNo("انتقال للتالي؟ (Y/N)")) break;
+  }
+
+  // ==================== [3] المحور A3 ====================
+  while(true) {
+    Serial.println(F("\n--- [3] الذراع A3 ---"));
+    cur_A3 = askFloat("التيار (A): "); mic_A3 = askInt("Microstep: ");
+    
+    waitForAnyKey("اضغط لاختبار الاتجاه...");
+    int dt = testDirectionTimeBased(A3_STEP, A3_DIR, -1, -1, HIGH, LOW, pulse_delay_normal, A3_REF);
+    if (dt == -1) { handleEmergencyStop(A3_STEP, A3_DIR, -1, -1, HIGH, LOW, pulse_delay_normal); continue; }
+    dir_A3 = (dt == 1) ? HIGH : LOW;
+    
+    Serial.println(F("يتحرك نحو سويتش المرجع..."));
+    if(!moveToSwitch(A3_STEP, A3_DIR, dir_A3, A3_REF, -1, pulse_delay_normal)) {
+      handleEmergencyStop(A3_STEP, A3_DIR, -1, -1, dir_A3, LOW, pulse_delay_normal); continue;
+    }
+    
+    clearSerial();
+    Serial.println(F("الذراع يتحرك للعد.. أرسل (S) للإيقاف الموجه، أو (E) للطوارئ:"));
+    steps_A3 = countStepsAndEscape(A3_STEP, A3_DIR, !dir_A3, A3_REF, -1, pulse_delay_normal, true);
+    if(steps_A3 == -1) { handleEmergencyStop(A3_STEP, A3_DIR, -1, -1, !dir_A3, LOW, pulse_delay_normal); continue; }
+    
+    Serial.println(F("يعود للمنتصف..."));
+    if(!moveToCenter(steps_A3, A3_STEP, A3_DIR, dir_A3, pulse_delay_normal)) {
+      handleEmergencyStop(A3_STEP, A3_DIR, -1, -1, dir_A3, LOW, pulse_delay_normal); continue;
+    }
+    
+    saveToEEPROM(); // حفظ الفلاش
+    if(askYesNo("هل تريد طباعة تقرير المحور A3 الآن لنسخه؟ (Y/N)")) printAxisReport(3);
+    if(askYesNo("انتقال للتالي؟ (Y/N)")) break;
+  }
+
+  // ==================== [4] المحور A4 ====================
+  while(true) {
+    Serial.println(F("\n--- [4] الذراع A4 ---"));
+    cur_A4 = askFloat("التيار (A): "); mic_A4 = askInt("Microstep: ");
+    
+    waitForAnyKey("اضغط لاختبار الاتجاه...");
+    int dt = testDirectionTimeBased(A4_STEP, A4_DIR, -1, -1, HIGH, LOW, pulse_delay_normal, A4_REF);
+    if (dt == -1) { handleEmergencyStop(A4_STEP, A4_DIR, -1, -1, HIGH, LOW, pulse_delay_normal); continue; }
+    dir_A4 = (dt == 1) ? HIGH : LOW;
+    
+    Serial.println(F("يتحرك للسويتش..."));
+    if(!moveToSwitch(A4_STEP, A4_DIR, dir_A4, A4_REF, -1, pulse_delay_normal)) {
+      handleEmergencyStop(A4_STEP, A4_DIR, -1, -1, dir_A4, LOW, pulse_delay_normal); continue;
+    }
+    
+    clearSerial();
+    Serial.println(F("الذراع يتحرك للعد.. أرسل (S) للإيقاف الموجه، أو (E) للطوارئ:"));
+    steps_A4 = countStepsAndEscape(A4_STEP, A4_DIR, !dir_A4, A4_REF, -1, pulse_delay_normal, true);
+    if(steps_A4 == -1) { handleEmergencyStop(A4_STEP, A4_DIR, -1, -1, !dir_A4, LOW, pulse_delay_normal); continue; }
+    
+    Serial.println(F("يعود للمنتصف..."));
+    if(!moveToCenter(steps_A4, A4_STEP, A4_DIR, dir_A4, pulse_delay_normal)) {
+      handleEmergencyStop(A4_STEP, A4_DIR, -1, -1, dir_A4, LOW, pulse_delay_normal); continue;
+    }
+    
+    saveToEEPROM(); // حفظ الفلاش
+    if(askYesNo("هل تريد طباعة تقرير المحور A4 الآن لنسخه؟ (Y/N)")) printAxisReport(4);
+    if(askYesNo("انتقال للتالي؟ (Y/N)")) break;
+  }
+
+  // ==================== [5] المكعب A5 ====================
+  while(true) {
+    Serial.println(F("\n--- [5] المكعب A5 ---"));
+    cur_A5 = askFloat("التيار (A): "); mic_A5 = askInt("Microstep: "); cur_A6 = cur_A5; mic_A6 = mic_A5;
+    
+    Serial.println(F("\n[خطوة 1: اختبار التوافق الميكانيكي لحركة المكعب]"));
+    waitForAnyKey("اضغط لتشغيل الموتورين M5 و M6 معاً (DIR HIGH) لثانية واحدة...");
+    moveForOneSecond(M5_STEP, M5_DIR, M6_STEP, M6_DIR, HIGH, HIGH, pulse_delay_normal, HEAD_SHARED_SAFETY);
+    
+    if(askYesNo("هل تحرك المكعب بوضوح (أي أن الموتورين يعملان معاً في نفس الاتجاه ميكانيكياً)؟ (Y=نعم، N=لا الليزر دار)")) {
+        M6_same_as_M5_for_Cube = true;
+    } else {
+        M6_same_as_M5_for_Cube = false;
+    }
+
+    Serial.println(F("\n[خطوة 2: اختبار الاتجاه نحو سويتش الأمان]"));
+    bool d6_test = M6_same_as_M5_for_Cube ? HIGH : LOW;
+    waitForAnyKey("اضغط للبدء باختبار الاتجاه (1 ثانية)...");
+    int dt = testDirectionTimeBased(M5_STEP, M5_DIR, M6_STEP, M6_DIR, HIGH, d6_test, pulse_delay_normal, HEAD_SHARED_SAFETY);
+    if (dt == -1) { handleEmergencyStop(M5_STEP, M5_DIR, M6_STEP, M6_DIR, HIGH, d6_test, pulse_delay_normal); continue; }
+    dir_A5 = (dt == 1) ? HIGH : LOW;
+    
+    bool d5 = dir_A5;
+    bool d6 = M6_same_as_M5_for_Cube ? dir_A5 : !dir_A5;
+
+    Serial.println(F("يتحرك المكعب نحو سويتش الأمان المشترك..."));
+    if(!moveToSwitch(M5_STEP, M5_DIR, d5, HEAD_SHARED_SAFETY, -1, pulse_delay_normal, M6_STEP, M6_DIR, d6)) {
+      handleEmergencyStop(M5_STEP, M5_DIR, M6_STEP, M6_DIR, d5, d6, pulse_delay_normal); continue;
+    }
+    
+    clearSerial();
+    Serial.println(F("المكعب يتحرك للعد.. أرسل (S) للإيقاف، أو (E) للطوارئ:"));
+    steps_A5 = countStepsAndEscape(M5_STEP, M5_DIR, !d5, HEAD_SHARED_SAFETY, -1, pulse_delay_normal, true, M6_STEP, M6_DIR, !d6);
+    if(steps_A5 == -1) { handleEmergencyStop(M5_STEP, M5_DIR, M6_STEP, M6_DIR, !d5, !d6, pulse_delay_normal); continue; }
+    
+    Serial.println(F("يعود للمنتصف..."));
+    if(!moveToCenter(steps_A5, M5_STEP, M5_DIR, d5, pulse_delay_normal, M6_STEP, M6_DIR, d6)) {
+      handleEmergencyStop(M5_STEP, M5_DIR, M6_STEP, M6_DIR, d5, d6, pulse_delay_normal); continue;
+    }
+    
+    saveToEEPROM(); // حفظ الفلاش
+    if(askYesNo("هل تريد طباعة تقرير المكعب A5 الآن لنسخه؟ (Y/N)")) printAxisReport(5);
+    if(askYesNo("انتقال للمحور الأخير؟ (Y/N)")) break;
+  }
+
+  // ==================== [6] دوران الليزر A6 ====================
+  while(true) {
+    Serial.println(F("\n--- [6] دوران الليزر A6 ---"));
+    
+    Serial.println(F("\n[خطوة 1: اختبار التوافق الميكانيكي لدوران الليزر]"));
+    bool expected_m6_for_rot = !M6_same_as_M5_for_Cube;
+    waitForAnyKey("اضغط لتشغيل الموتورين لتجربة الدوران لثانية واحدة...");
+    moveForOneSecond(M5_STEP, M5_DIR, M6_STEP, M6_DIR, HIGH, expected_m6_for_rot ? HIGH : LOW, pulse_delay_normal);
+    
+    if(askYesNo("هل دار رأس الليزر بوضوح (أي أن الموتورين يعملان عكس بعض ميكانيكياً)؟ (Y=نعم، N=لا المكعب تحرك)")) {
+        M6_same_as_M5_for_Rotation = expected_m6_for_rot;
+    } else {
+        M6_same_as_M5_for_Rotation = !expected_m6_for_rot;
+    }
+
+    Serial.println(F("\n[خطوة 2: اختبار وتحديد اتجاه الدوران الموجب (البداية)]"));
+    bool d6_test = M6_same_as_M5_for_Rotation ? HIGH : LOW;
+    waitForAnyKey("اضغط لاختبار اتجاه الدوران (1 ثانية)...");
+    int dt = testDirectionTimeBased(M5_STEP, M5_DIR, M6_STEP, M6_DIR, HIGH, d6_test, pulse_delay_normal);
+    if (dt == -1) { handleEmergencyStop(M5_STEP, M5_DIR, M6_STEP, M6_DIR, HIGH, d6_test, pulse_delay_normal); continue; }
+    dir_A6 = (dt == 1) ? HIGH : LOW;
+    
+    bool d5 = dir_A6;
+    bool d6 = M6_same_as_M5_for_Rotation ? dir_A6 : !dir_A6;
+
+    clearSerial();
+    Serial.println(F("\n[خطوة 3: التحرك اليدوي لضبط نقطة (البداية)]"));
+    Serial.println(F("الرأس يدور الآن.. أرسل (S) للإيقاف الموجه واعتماد هذه النقطة كبداية، أو (E) للطوارئ:"));
+    
+    digitalWrite(M5_DIR, d5); digitalWrite(M6_DIR, d6);
+    bool estopTriggered = false;
+    while (true) {
+      char cmd = checkLiveCommand();
+      if (cmd == 'E') { estopTriggered = true; break; }
+      if (cmd == 'S') { break; } 
+      digitalWrite(M5_STEP, HIGH); digitalWrite(M6_STEP, HIGH); delayMicroseconds(pulse_delay_normal);
+      digitalWrite(M5_STEP, LOW);  digitalWrite(M6_STEP, LOW);  delayMicroseconds(pulse_delay_normal);
+    }
+    if(estopTriggered) { handleEmergencyStop(M5_STEP, M5_DIR, M6_STEP, M6_DIR, d5, d6, pulse_delay_normal); continue; }
+    
+    clearSerial();
+    Serial.println(F("\n[خطوة 4: التحرك لعد الخطوات وضبط نقطة (النهاية)]"));
+    Serial.println(F("الرأس يدور للعد بالاتجاه المعاكس.. أرسل (S) للإيقاف الموجه واعتماد النهاية، أو (E) للطوارئ:"));
+    
+    steps_A6 = countStepsAndEscape(M5_STEP, M5_DIR, !d5, -1, -1, pulse_delay_normal, true, M6_STEP, M6_DIR, !d6);
+    if(steps_A6 == -1) { handleEmergencyStop(M5_STEP, M5_DIR, M6_STEP, M6_DIR, !d5, !d6, pulse_delay_normal); continue; }
+    
+    Serial.println(F("يعود للمنتصف..."));
+    if(!moveToCenter(steps_A6, M5_STEP, M5_DIR, d5, pulse_delay_normal, M6_STEP, M6_DIR, d6)) {
+      handleEmergencyStop(M5_STEP, M5_DIR, M6_STEP, M6_DIR, d5, d6, pulse_delay_normal); continue;
+    }
+    
+    saveToEEPROM(); // حفظ الفلاش
+    if(askYesNo("هل تريد طباعة تقرير دوران الليزر A6 الآن لنسخه؟ (Y/N)")) printAxisReport(6);
+    if(askYesNo("تم إنهاء جميع المحاور! هل تريد إعادة A6؟ (Y=إعادة، N=إنهاء الدورة)")) continue; else break;
+  }
+
+  // كل محور عاد بالفعل إلى منتصف المشوار طبقاً لنتيجة معايرته.
+  markCurrentSessionAtHome();
+  saveToEEPROM();
+
+  Serial.println(F("\n=========================================================="));
+  Serial.println(F("اكتملت المعايرة الكلية، وجميع المحاور مسجلة الآن عند Home = منتصف المشوار."));
+  Serial.println(F("سيتم الآن اختبار خرج الليزر، ثم يمكنك إرسال D لتشغيل الرسمة التجريبية."));
+  Serial.println(F("=========================================================="));
+
+  laserVerified = testLaserInteractive();
+
+  if (laserVerified) {
+    Serial.println(F("\n>> النظام جاهز: أرسل D لتشغيل الحركة التجريبية الآمنة."));
+  } else {
+    Serial.println(F("\n>> المعايرة سليمة، لكن تشغيل D سيظل موقوفاً حتى نجاح اختبار الليزر بالأمر L."));
+  }
+}
+
+// ---------------------------------------------------------
+// دالة استدعاء البيانات من الفلاش وطباعتها
+// ---------------------------------------------------------
+void recallAndPrintEEPROM() {
+  EEPROM.get(EEPROM_ADDR, savedData);
+  
+  if (savedData.magicNumber != VALID_MAGIC_NUM) {
+    Serial.println(F("\n[!] خطأ: لا توجد بيانات معايرة مسجلة في الذاكرة! (الذاكرة فارغة أو أردوينو جديد)"));
+    return;
+  }
+  
+  Serial.println(F("\n=================================================================="));
+  Serial.println(F("       تم استدعاء بيانات المعايرة من الذاكرة الدائمة (EEPROM)      "));
+  Serial.println(F("=================================================================="));
+  
+  Serial.print(F("[A1] إجمالي: ")); Serial.print(savedData.s_A1); Serial.print(F(" | منتصف: ")); Serial.print(savedData.s_A1/2); Serial.println(savedData.d_A1 ? " | DIR: HIGH" : " | DIR: LOW");
+  Serial.print(F("[A2] إجمالي: ")); Serial.print(savedData.s_A2); Serial.print(F(" | منتصف: ")); Serial.print(savedData.s_A2/2); Serial.println(savedData.d_A2 ? " | DIR: HIGH" : " | DIR: LOW");
+  Serial.print(F("[A3] إجمالي: ")); Serial.print(savedData.s_A3); Serial.print(F(" | منتصف: ")); Serial.print(savedData.s_A3/2); Serial.println(savedData.d_A3 ? " | DIR: HIGH" : " | DIR: LOW");
+  Serial.print(F("[A4] إجمالي: ")); Serial.print(savedData.s_A4); Serial.print(F(" | منتصف: ")); Serial.print(savedData.s_A4/2); Serial.println(savedData.d_A4 ? " | DIR: HIGH" : " | DIR: LOW");
+  
+  Serial.print(F("[A5] إجمالي: ")); Serial.print(savedData.s_A5); Serial.print(F(" | منتصف: ")); Serial.print(savedData.s_A5/2);
+  Serial.println(savedData.d_A5 ? (savedData.m6_cube ? " | M5/M6: HIGH/HIGH" : " | M5/M6: HIGH/LOW") : (savedData.m6_cube ? " | M5/M6: LOW/LOW" : " | M5/M6: LOW/HIGH"));
+  
+  Serial.print(F("[A6] إجمالي: ")); Serial.print(savedData.s_A6); Serial.print(F(" | منتصف: ")); Serial.print(savedData.s_A6/2);
+  Serial.println(savedData.d_A6 ? (savedData.m6_rot ? " | M5/M6: HIGH/HIGH" : " | M5/M6: HIGH/LOW") : (savedData.m6_rot ? " | M5/M6: LOW/LOW" : " | M5/M6: LOW/HIGH"));
+  
+  Serial.println(F("=================================================================="));
+  waitForAnyKey(F(">> اضغط أي مفتاح للعودة للقائمة..."));
+}
+// ---------------------------------------------------------
+// إضافات التشغيل بعد المعايرة
+// ---------------------------------------------------------
+
+void setLaser(bool on) {
+  bool level = on ? LASER_ACTIVE_HIGH : !LASER_ACTIVE_HIGH;
+  digitalWrite(LASER_PIN, level ? HIGH : LOW);
+}
+
+bool testLaserInteractive() {
+  setLaser(false);
+
+  Serial.println(F("\n================ اختبار الليزر ================"));
+  Serial.println(F("تأكد أن الشعاع داخل حيز آمن ومغلق، ولا يوجد شخص أمام مساره."));
+  Serial.println(F("الاختبار يرسل نبضة تشغيل قصيرة ثم يفصل الليزر تلقائياً."));
+
+  while (true) {
+    waitForAnyKey(F("اضغط أي مفتاح لإرسال نبضة اختبار قصيرة..."));
+
+    setLaser(true);
+    delay(700);
+    setLaser(false);
+
+    if (askYesNo(F("هل ظهر ضوء الليزر أثناء النبضة؟ (Y/N)"))) {
+      Serial.println(F(">> تم تأكيد الليزر يدوياً، وهو الآن مفصول."));
+      return true;
+    }
+
+    if (!askYesNo(F("لم يتم تأكيد الليزر. هل تريد إعادة الاختبار؟ (Y/N)"))) {
+      setLaser(false);
+      Serial.println(F(">> خرج الليزر غير مؤكد؛ تم إبقاؤه مفصولاً."));
+      return false;
+    }
+  }
+}
+
+void markCurrentSessionAtHome() {
+  for (int axis = 1; axis <= 6; axis++) {
+    runtimePos[axis] = 0;
+  }
+  sessionHomeKnown = true;
+  lastRuntimeStop = RUNTIME_STOP_NONE;
+  setLaser(false);
+}
+
+long getAxisTravelSteps(byte axis) {
+  switch (axis) {
+    case 1: return steps_A1;
+    case 2: return steps_A2;
+    case 3: return steps_A3;
+    case 4: return steps_A4;
+    case 5: return steps_A5;
+    case 6: return steps_A6;
+    default: return 0;
+  }
+}
+
+long getAxisSoftLimit(byte axis) {
+  long halfTravel = getAxisTravelSteps(axis) / 2L;
+  if (halfTravel <= 1) return 0;
+
+  // هامش داخلي 5%، وبحد أدنى 50 خطوة متى كان المشوار يسمح بذلك.
+  long margin = halfTravel / 20L;
+  if (margin < 50L) margin = 50L;
+
+  if (halfTravel <= margin + 2L) {
+    return halfTravel - 1L;
+  }
+  return halfTravel - margin;
+}
+
+long getDemoAmplitudePercent(byte axis, byte percent) {
+  long limit = getAxisSoftLimit(axis);
+  if (limit <= 4L || percent == 0 || percent >= 100) return 0;
+
+  // النسبة محسوبة من الحد البرمجي الآمن، وليس من نهاية المشوار الميكانيكية.
+  long value = (limit * (long)percent) / 100L;
+  if (value < 10L) value = limit / 2L;
+  if (value >= limit) value = limit - 1L;
+  return value;
+}
+
+unsigned int getProfilePulseDelay(long stepIndex, long totalSteps, unsigned int cruiseDelayUs) {
+  if (totalSteps <= 1L) return cruiseDelayUs;
+
+  unsigned int startDelayUs = DEMO_START_DELAY_US;
+  if (startDelayUs < cruiseDelayUs) startDelayUs = cruiseDelayUs;
+
+  long rampSteps = totalSteps / 4L;
+  if (rampSteps > DEMO_ACCEL_MAX_STEPS) rampSteps = DEMO_ACCEL_MAX_STEPS;
+  if (rampSteps < 1L) return cruiseDelayUs;
+
+  long fromStart = stepIndex;
+  long fromEnd = totalSteps - 1L - stepIndex;
+  long rampPosition = fromStart < fromEnd ? fromStart : fromEnd;
+
+  if (rampPosition >= rampSteps) return cruiseDelayUs;
+
+  unsigned long delayRange = (unsigned long)(startDelayUs - cruiseDelayUs);
+  unsigned long reduction = (delayRange * (unsigned long)rampPosition) / (unsigned long)rampSteps;
+  return (unsigned int)(startDelayUs - reduction);
+}
+
+bool isSwitchActive(int pin) {
+  return digitalRead(pin) == SWITCH_TRIGGERED_STATE;
+}
+
+bool anyAxisSwitchActive(byte axis) {
+  switch (axis) {
+    case 1: return isSwitchActive(A1_MIN) || isSwitchActive(A1_MAX);
+    case 2: return isSwitchActive(A2_MIN) || isSwitchActive(A2_MAX);
+    case 3: return isSwitchActive(A3_REF);
+    case 4: return isSwitchActive(A4_REF);
+    case 5: return isSwitchActive(HEAD_SHARED_SAFETY);
+    case 6: return isSwitchActive(HEAD_SHARED_SAFETY);
+    default: return false;
+  }
+}
+
+bool switchBlocksDirection(byte axis, int directionSign) {
+  // الإشارة الموجبة = بعيداً عن سويتش البداية، والسالبة = نحو سويتش البداية.
+  switch (axis) {
+    case 1:
+      if (directionSign < 0 && isSwitchActive(A1_MIN)) return true;
+      if (directionSign > 0 && isSwitchActive(A1_MAX)) return true;
+      return false;
+
+    case 2:
+      if (directionSign < 0 && isSwitchActive(A2_MIN)) return true;
+      if (directionSign > 0 && isSwitchActive(A2_MAX)) return true;
+      return false;
+
+    case 3:
+      return directionSign < 0 && isSwitchActive(A3_REF);
+
+    case 4:
+      return directionSign < 0 && isSwitchActive(A4_REF);
+
+    case 5:
+      return directionSign < 0 && isSwitchActive(HEAD_SHARED_SAFETY);
+
+    case 6:
+      // A6 لا يملك سويتش نهاية مستقل. ظهور السويتش المشترك أثناء دورانه يعد حالة أمان.
+      return isSwitchActive(HEAD_SHARED_SAFETY);
+
+    default:
+      return true;
+  }
+}
+
+void setVirtualAxisDirection(byte axis, int directionSign) {
+  bool physicalDirection;
+
+  switch (axis) {
+    case 1:
+      physicalDirection = directionSign > 0 ? !dir_A1 : dir_A1;
+      digitalWrite(A1_DIR, physicalDirection);
+      break;
+
+    case 2:
+      physicalDirection = directionSign > 0 ? !dir_A2 : dir_A2;
+      digitalWrite(A2_DIR, physicalDirection);
+      break;
+
+    case 3:
+      physicalDirection = directionSign > 0 ? !dir_A3 : dir_A3;
+      digitalWrite(A3_DIR, physicalDirection);
+      break;
+
+    case 4:
+      physicalDirection = directionSign > 0 ? !dir_A4 : dir_A4;
+      digitalWrite(A4_DIR, physicalDirection);
+      break;
+
+    case 5: {
+      bool d5 = directionSign > 0 ? !dir_A5 : dir_A5;
+      bool d6 = M6_same_as_M5_for_Cube ? d5 : !d5;
+      digitalWrite(M5_DIR, d5);
+      digitalWrite(M6_DIR, d6);
+      break;
+    }
+
+    case 6: {
+      bool d5 = directionSign > 0 ? !dir_A6 : dir_A6;
+      bool d6 = M6_same_as_M5_for_Rotation ? d5 : !d5;
+      digitalWrite(M5_DIR, d5);
+      digitalWrite(M6_DIR, d6);
+      break;
+    }
+  }
+}
+
+void setVirtualAxisStepLevel(byte axis, bool highLevel) {
+  int level = highLevel ? HIGH : LOW;
+
+  switch (axis) {
+    case 1:
+      digitalWrite(A1_STEP, level);
+      break;
+    case 2:
+      digitalWrite(A2_STEP, level);
+      break;
+    case 3:
+      digitalWrite(A3_STEP, level);
+      break;
+    case 4:
+      digitalWrite(A4_STEP, level);
+      break;
+    case 5:
+    case 6:
+      digitalWrite(M5_STEP, level);
+      digitalWrite(M6_STEP, level);
+      break;
+  }
+}
+
+bool runtimeEmergencyRequested() {
+  if (Serial.available() > 0) {
+    char c = toupper(Serial.read());
+    if (c == 'E') {
+      setLaser(false);
+      lastRuntimeStop = RUNTIME_STOP_ESTOP;
+      Serial.println(F("\n!!! E-STOP: توقفت النبضات فوراً وتم فصل الليزر. لن تحدث عودة آلية للحركة !!!"));
+      return true;
+    }
+  }
+  return false;
+}
+
+bool targetInsideRecordedRange(byte axis, long target) {
+  long limit = getAxisSoftLimit(axis);
+  return limit > 0 && target >= -limit && target <= limit;
+}
+
+bool nextStepInsideRecordedRange(byte axis, int directionSign) {
+  long nextPosition = runtimePos[axis] + directionSign;
+  long limit = getAxisSoftLimit(axis);
+  return nextPosition >= -limit && nextPosition <= limit;
+}
+
+bool reverseImmediatelyAndReleaseSwitch(byte axis, int previousDirectionSign) {
+  setLaser(false);
+
+  int reverseSign = -previousDirectionSign;
+  setVirtualAxisDirection(axis, reverseSign);  // عكس اتجاه DIR أولاً قبل أي طباعة أو انتظار
+
+  long moved = 0;
+
+  // الخروج من السويتش أولاً.
+  while (anyAxisSwitchActive(axis) && moved < RUNTIME_BACKOFF_MAX_STEPS) {
+    if (runtimeEmergencyRequested()) return false;
+
+    setVirtualAxisStepLevel(axis, true);
+    delayMicroseconds(pulse_delay_normal);
+    setVirtualAxisStepLevel(axis, false);
+    delayMicroseconds(pulse_delay_normal);
+
+    runtimePos[axis] += reverseSign;
+    moved++;
+  }
+
+  if (anyAxisSwitchActive(axis)) {
+    lastRuntimeStop = RUNTIME_STOP_BACKOFF_FAILED;
+    sessionHomeKnown = false;
+    setLaser(false);
+    Serial.println(F("\n!! فشل تحرير السويتش بعد عكس الاتجاه. تم منع أي حركة آلية أخرى. أعد المعايرة والفحص الميكانيكي."));
+    return false;
+  }
+
+  // مسافة إضافية صغيرة بعد تحرير السويتش لمنع الارتداد الميكانيكي.
+  for (long i = 0; i < RUNTIME_BACKOFF_EXTRA_STEPS; i++) {
+    if (runtimeEmergencyRequested()) return false;
+
+    setVirtualAxisStepLevel(axis, true);
+    delayMicroseconds(pulse_delay_normal);
+    setVirtualAxisStepLevel(axis, false);
+    delayMicroseconds(pulse_delay_normal);
+
+    runtimePos[axis] += reverseSign;
+  }
+
+  lastRuntimeStop = RUNTIME_STOP_SWITCH;
+  Serial.print(F("\n>> تم لمس سويتش المحور A"));
+  Serial.print(axis);
+  Serial.println(F(": عُكس الاتجاه فوراً، تم تحرير السويتش، وأُلغيت الرسمة الحالية."));
+  return true;
+}
+
+bool prepareRuntimeStep(byte axis, int directionSign) {
+  if (switchBlocksDirection(axis, directionSign)) {
+    reverseImmediatelyAndReleaseSwitch(axis, directionSign);
+    return false;
+  }
+
+  if (!nextStepInsideRecordedRange(axis, directionSign)) {
+    setLaser(false);
+    lastRuntimeStop = RUNTIME_STOP_SOFT_LIMIT;
+    Serial.print(F("\n>> تم منع تجاوز النطاق المسجل للمحور A"));
+    Serial.print(axis);
+    Serial.println(F(". أُلغيت الحركة قبل تخطي الحد البرمجي."));
+    return false;
+  }
+
+  return true;
+}
+
+bool moveSingleAxisTo(byte axis, long target, bool laserOnDuringMove, unsigned int cruiseDelayUs) {
+  if (!targetInsideRecordedRange(axis, target)) {
+    setLaser(false);
+    lastRuntimeStop = RUNTIME_STOP_INVALID_TARGET;
+    Serial.print(F("\n>> هدف غير صالح للمحور A"));
+    Serial.println(axis);
+    return false;
+  }
+
+  long delta = target - runtimePos[axis];
+  if (delta == 0) {
+    setLaser(laserOnDuringMove);
+    return true;
+  }
+
+  int directionSign = delta > 0 ? 1 : -1;
+  long requiredSteps = delta > 0 ? delta : -delta;
+
+  setVirtualAxisDirection(axis, directionSign);
+  delayMicroseconds(DEMO_DIR_SETTLE_US);
+  setLaser(laserOnDuringMove);
+
+  for (long i = 0; i < requiredSteps; i++) {
+    if (runtimeEmergencyRequested()) return false;
+    if (!prepareRuntimeStep(axis, directionSign)) return false;
+
+    unsigned int pulseDelayUs = getProfilePulseDelay(i, requiredSteps, cruiseDelayUs);
+
+    setVirtualAxisStepLevel(axis, true);
+    delayMicroseconds(pulseDelayUs);
+    setVirtualAxisStepLevel(axis, false);
+    delayMicroseconds(pulseDelayUs);
+
+    runtimePos[axis] += directionSign;
+  }
+
+  return true;
+}
+
+bool moveParallelA1ToA4(long target1, long target2, long target3, long target4, bool laserOnDuringMove, unsigned int cruiseDelayUs) {
+  long target[4] = {target1, target2, target3, target4};
+  long delta[4];
+  long distance[4];
+  long accumulator[4] = {0, 0, 0, 0};
+  int directionSign[4] = {0, 0, 0, 0};
+  long masterSteps = 0;
+
+  for (byte i = 0; i < 4; i++) {
+    byte axis = i + 1;
+
+    if (!targetInsideRecordedRange(axis, target[i])) {
+      setLaser(false);
+      lastRuntimeStop = RUNTIME_STOP_INVALID_TARGET;
+      Serial.print(F("\n>> هدف خارج نطاق المعايرة للمحور A"));
+      Serial.println(axis);
+      return false;
+    }
+
+    delta[i] = target[i] - runtimePos[axis];
+    directionSign[i] = delta[i] > 0 ? 1 : (delta[i] < 0 ? -1 : 0);
+    distance[i] = delta[i] >= 0 ? delta[i] : -delta[i];
+
+    if (distance[i] > masterSteps) masterSteps = distance[i];
+    if (directionSign[i] != 0) setVirtualAxisDirection(axis, directionSign[i]);
+  }
+
+  delayMicroseconds(DEMO_DIR_SETTLE_US);
+  setLaser(laserOnDuringMove);
+  if (masterSteps == 0) return true;
+
+  for (long master = 0; master < masterSteps; master++) {
+    if (runtimeEmergencyRequested()) return false;
+
+    bool pulseAxis[4] = {false, false, false, false};
+
+    // خوارزمية DDA/Bresenham لتصل المحاور الأربعة إلى أهدافها في نفس زمن المقطع.
+    for (byte i = 0; i < 4; i++) {
+      if (distance[i] == 0) continue;
+
+      accumulator[i] += distance[i];
+      if (accumulator[i] >= masterSteps) {
+        accumulator[i] -= masterSteps;
+        pulseAxis[i] = true;
+
+        byte axis = i + 1;
+        if (!prepareRuntimeStep(axis, directionSign[i])) return false;
+      }
+    }
+
+    for (byte i = 0; i < 4; i++) {
+      if (pulseAxis[i]) setVirtualAxisStepLevel(i + 1, true);
+    }
+
+    unsigned int pulseDelayUs = getProfilePulseDelay(master, masterSteps, cruiseDelayUs);
+    delayMicroseconds(pulseDelayUs);
+
+    for (byte i = 0; i < 4; i++) {
+      if (pulseAxis[i]) setVirtualAxisStepLevel(i + 1, false);
+    }
+
+    delayMicroseconds(pulseDelayUs);
+
+    for (byte i = 0; i < 4; i++) {
+      if (pulseAxis[i]) runtimePos[i + 1] += directionSign[i];
+    }
+  }
+
+  return true;
+}
+
+bool allRuntimePositionsAtHome() {
+  for (byte axis = 1; axis <= 6; axis++) {
+    if (runtimePos[axis] != 0) return false;
+  }
+  return true;
+}
+
+bool returnAllAxesToHome() {
+  setLaser(false);
+
+  if (!sessionHomeKnown) {
+    Serial.println(F("\n>> لا يمكن تنفيذ Home آلياً لأن مواضع الجلسة غير موثوقة. نفّذ معايرة كاملة بالأمر S."));
+    return false;
+  }
+
+  Serial.println(F("\n>> العودة إلى Home: A1-A4 بالتوازي، ثم A5 وA6 بالتتابع..."));
+  lastRuntimeStop = RUNTIME_STOP_NONE;
+
+  if (!moveParallelA1ToA4(0, 0, 0, 0, false, DEMO_HOME_DELAY_US)) {
+    setLaser(false);
+    Serial.println(F(">> تعذر إكمال Home للمحاور A1-A4."));
+    return false;
+  }
+
+  // A5 وA6 يشتركان في M5/M6؛ لذلك لا يتم تشغيلهما كحركتين افتراضيتين مستقلتين في اللحظة نفسها.
+  if (!moveSingleAxisTo(5, 0, false, DEMO_HOME_DELAY_US)) {
+    setLaser(false);
+    Serial.println(F(">> تعذر إكمال Home للمحور A5."));
+    return false;
+  }
+
+  if (!moveSingleAxisTo(6, 0, false, DEMO_HOME_DELAY_US)) {
+    setLaser(false);
+    Serial.println(F(">> تعذر إكمال Home للمحور A6."));
+    return false;
+  }
+
+  setLaser(false);
+
+  if (allRuntimePositionsAtHome()) {
+    Serial.println(F(">> تم الوصول إلى Home لجميع المحاور، والليزر مفصول."));
+    return true;
+  }
+
+  Serial.println(F(">> تحذير: لم تتطابق جميع العدادات مع الصفر."));
+  return false;
+}
+
+bool executeDemoSegmentResult(bool result) {
+  if (result) return true;
+
+  setLaser(false);
+
+  if (lastRuntimeStop == RUNTIME_STOP_ESTOP) {
+    Serial.println(F(">> بسبب E-STOP لن يحاول البرنامج تحريك الماكينة تلقائياً إلى Home."));
+    return false;
+  }
+
+  if (sessionHomeKnown) {
+    Serial.println(F(">> يتم إلغاء بقية الرسمة والعودة إلى Home بدون ليزر..."));
+    returnAllAxesToHome();
+  }
+
+  return false;
+}
+
+void runDrawingDemo() {
+  setLaser(false);
+
+  if (!sessionHomeKnown) {
+    Serial.println(F("\n>> الأمر D متاح فقط بعد معايرة كاملة في نفس جلسة التشغيل بالأمر S."));
+    Serial.println(F("قراءة EEPROM وحدها لا تثبت أن الماكينة موجودة فعلياً في المنتصف."));
+    return;
+  }
+
+  if (!laserVerified) {
+    Serial.println(F("\n>> لم يتم تأكيد الليزر. نفّذ الأمر L أولاً."));
+    return;
+  }
+
+  if (!allRuntimePositionsAtHome()) {
+    Serial.println(F("\n>> الماكينة ليست عند Home من واقع عدادات الجلسة؛ ستعود أولاً إلى المنتصف."));
+    if (!returnAllAxesToHome()) return;
+  }
+
+  // حركات أكبر وأكثر وضوحاً، لكنها تظل محسوبة من داخل الحد البرمجي الآمن.
+  long a1 = getDemoAmplitudePercent(1, 62);
+  long a2 = getDemoAmplitudePercent(2, 55);
+  long a3 = getDemoAmplitudePercent(3, 48);
+  long a4 = getDemoAmplitudePercent(4, 48);
+  long a5 = getDemoAmplitudePercent(5, 45);
+  long a6 = getDemoAmplitudePercent(6, 40);
+
+  if (a1 == 0 || a2 == 0 || a3 == 0 || a4 == 0 || a5 == 0 || a6 == 0) {
+    Serial.println(F("\n>> أحد نطاقات المعايرة غير صالح أو صغير جداً لتشغيل الرسمة التجريبية."));
+    return;
+  }
+
+  clearSerial();
+  lastRuntimeStop = RUNTIME_STOP_NONE;
+
+  Serial.println(F("\n=========================================================="));
+  Serial.println(F("بدء الرسمة التجريبية السريعة والواضحة: أرسل E للإيقاف الفوري."));
+  Serial.println(F("الانتقال سريع والليزر مفصول، والرسم أسرع مع تسارع وتباطؤ تلقائيين."));
+  Serial.println(F("A1-A4 تعمل بالتوازي، ثم A5 وA6 بالتتابع لاشتراكهما في M5/M6."));
+  Serial.println(F("=========================================================="));
+
+  // انتقال سريع إلى نقطة البداية والليزر مفصول.
+  Serial.println(F("[1/8] انتقال إلى نقطة البداية..."));
+  if (!executeDemoSegmentResult(moveParallelA1ToA4(-a1, -a2, a3, -a4, false, DEMO_TRAVEL_DELAY_US))) return;
+  delay(DEMO_SEGMENT_PAUSE_MS);
+
+  // مسار مغلق كبير وواضح للمحاور A1-A4.
+  Serial.println(F("[2/8] رسم الضلع الأول..."));
+  if (!executeDemoSegmentResult(moveParallelA1ToA4(a1, -a2, -a3, a4, true, DEMO_DRAW_DELAY_US))) return;
+
+  Serial.println(F("[3/8] رسم الضلع الثاني..."));
+  if (!executeDemoSegmentResult(moveParallelA1ToA4(a1, a2, a3, -a4, true, DEMO_DRAW_DELAY_US))) return;
+
+  Serial.println(F("[4/8] رسم الضلع الثالث..."));
+  if (!executeDemoSegmentResult(moveParallelA1ToA4(-a1, a2, -a3, a4, true, DEMO_DRAW_DELAY_US))) return;
+
+  Serial.println(F("[5/8] إغلاق المسار..."));
+  if (!executeDemoSegmentResult(moveParallelA1ToA4(-a1, -a2, a3, -a4, true, DEMO_DRAW_DELAY_US))) return;
+
+  // العودة للمنتصف بسرعة انتقال والليزر مفصول.
+  setLaser(false);
+  delay(DEMO_SEGMENT_PAUSE_MS);
+  Serial.println(F("[6/8] عودة A1-A4 إلى المنتصف..."));
+  if (!executeDemoSegmentResult(moveParallelA1ToA4(0, 0, 0, 0, false, DEMO_TRAVEL_DELAY_US))) return;
+
+  // حركة A5 التفاضلية الكبيرة بالتتابع.
+  Serial.println(F("[7/8] حركة المكعب A5..."));
+  if (!executeDemoSegmentResult(moveSingleAxisTo(5, a5, false, DEMO_TRAVEL_DELAY_US))) return;
+  if (!executeDemoSegmentResult(moveSingleAxisTo(5, -a5, true, DEMO_DRAW_DELAY_US))) return;
+  setLaser(false);
+  if (!executeDemoSegmentResult(moveSingleAxisTo(5, 0, false, DEMO_HOME_DELAY_US))) return;
+
+  // حركة A6 التفاضلية الكبيرة بالتتابع.
+  Serial.println(F("[8/8] دوران رأس الليزر A6..."));
+  if (!executeDemoSegmentResult(moveSingleAxisTo(6, a6, false, DEMO_TRAVEL_DELAY_US))) return;
+  if (!executeDemoSegmentResult(moveSingleAxisTo(6, -a6, true, DEMO_DRAW_DELAY_US))) return;
+  setLaser(false);
+  if (!executeDemoSegmentResult(moveSingleAxisTo(6, 0, false, DEMO_HOME_DELAY_US))) return;
+
+  // ضمان نهائي مستقل أن كل المحاور عند Home.
+  if (returnAllAxesToHome()) {
+    Serial.println(F("\n>> انتهت الرسمة السريعة بنجاح. جميع المحاور عند Home والليزر مفصول."));
+  }
+}
+
